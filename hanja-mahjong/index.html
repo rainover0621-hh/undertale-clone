@@ -98,7 +98,7 @@ button:disabled { opacity: 0.45; cursor: default; }
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
 #board { position: relative; touch-action: manipulation; }
-#path { position: absolute; inset: 0; pointer-events: none; overflow: visible; z-index: 500; }
+#path { position: absolute; inset: 0; pointer-events: none; overflow: visible; z-index: 5000; }
 #path polyline { fill: none; stroke: var(--path); stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 2px #fff) drop-shadow(0 0 5px rgba(255,106,61,.6)); }
 
 /* 입체 마작패: 상아색 앞면 + 크림색 두께 + 옥색 뒷판, 오른쪽 아래로 쌓인 그림자 */
@@ -148,6 +148,9 @@ button:disabled { opacity: 0.45; cursor: default; }
     4px 4px 0 #2aa883, 5px 5px 0 #1f9474, 6px 6px 0 #187a60,
     10px 16px 16px rgba(30, 60, 50, .35);
 }
+.tile.under { pointer-events: none; }
+.tile.locked { filter: brightness(.8) saturate(.65); cursor: not-allowed; }
+.tile.locked:hover { transform: none; }
 .tile.hint { animation: pulse 0.9s ease-in-out 3; }
 .tile.bad { animation: shake .35s; }
 .tile.gone { opacity: 0; transform: scale(.6) translateY(-10px); pointer-events: none; }
@@ -167,7 +170,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 #toast .hz { font-family: var(--font-hanja); font-weight: 700; font-size: 22px; margin-right: 6px; vertical-align: -2px; }
 
 #win {
-  position: absolute; inset: -8px; z-index: 600;
+  position: absolute; inset: -8px; z-index: 6000;
   display: grid; place-items: center;
   background: rgba(255,255,255,.7);
   backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
@@ -248,7 +251,7 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; font-weight: 50
   <header>
     <div>
       <h1><span class="hz-font">漢字</span>마작<small>한자능력시험 8급–7급</small></h1>
-      <p class="rule">한자 패와 그 한자의 <b>음</b> 패 또는 <b>뜻</b> 패를 차례로 누르세요. 두 패를 잇는 선이 두 번 이하로 꺾이면 짝이 사라집니다.</p>
+      <p class="rule" id="rule">한자 패와 그 한자의 <b>음</b> 패 또는 <b>뜻</b> 패를 차례로 누르세요. 두 패를 잇는 선이 두 번 이하로 꺾이면 짝이 사라집니다.</p>
     </div>
     <div class="controls">
       <label for="range">범위
@@ -265,11 +268,18 @@ summary { cursor: pointer; color: var(--muted); font-size: 14px; font-weight: 50
           <option value="x" selected>섞어서</option>
         </select>
       </label>
+      <label for="layers">쌓기
+        <select id="layers">
+          <option value="1">1층 (선 잇기)</option>
+          <option value="2" selected>2층</option>
+          <option value="3">3층</option>
+        </select>
+      </label>
       <label for="size">판 크기
         <select id="size">
-          <option value="s">작게 (24짝)</option>
-          <option value="n" selected>보통 (40짝)</option>
-          <option value="l">크게 (48짝)</option>
+          <option value="s">작게</option>
+          <option value="n" selected>보통</option>
+          <option value="l">크게</option>
         </select>
       </label>
       <button class="primary" id="newBtn">새 판</button>
@@ -329,14 +339,18 @@ for (const g of ["8", "72", "7"]) {
     DATA.push(d); BY[c] = d;
   }
 }
-const SIZES = { s: [8, 6], n: [10, 8], l: [12, 8] }; // [긴 변, 짧은 변]
+// [긴 변, 짧은 변]. 쌓기 판은 한 층 올라갈 때마다 사방으로 한 칸씩 줄어든다.
+const FLAT_SIZES = { s: [8, 6], n: [10, 8], l: [12, 8] };
+const STACK_SIZES = { s: [6, 6], n: [8, 6], l: [10, 6] };
 
 // ── 상태 ──
-let R = 0, C = 0, grid = [], sel = null, score = 0, elapsed = 0, timer = null;
+// stack[r][c] = 아래층부터 쌓인 패 배열. 1층 판은 길이가 0 또는 1.
+let R = 0, C = 0, layers = 1, stack = [], sel = null, score = 0, elapsed = 0, timer = null;
 let hints = 5, shuffles = 3, lastMatch = 0, combo = 0, learned = [], busy = false, over = false;
 const $ = id => document.getElementById(id);
 const boardEl = $("board"), pathEl = $("path");
-let cell = { w: 40, h: 52, m: 18 };
+let cell = { w: 40, h: 52, m: 18, lift: 0 };
+const DEPTH = 6; // 패 두께(그림자)만큼 비워 둔다
 
 function pool(range) {
   if (range === "8") return DATA.filter(d => d.g === "8");
@@ -355,7 +369,7 @@ function pickPairs(n, range, mode) {
   for (const d of shuffle(pool(range))) {
     if (chosen.length >= n) break;
     const kind = mode === "x" ? (Math.random() < 0.5 ? "e" : "m") : mode;
-    let key = kind + partnerText(d, kind);
+    const key = kind + partnerText(d, kind);
     if (used.has(key)) {
       if (mode !== "x") continue;
       const k2 = kind === "e" ? "m" : "e";
@@ -367,28 +381,91 @@ function pickPairs(n, range, mode) {
   }
   const pairs = chosen.slice();
   for (let i = 0; pairs.length < n; i++) pairs.push(chosen[i % chosen.length]); // 모자라면 같은 짝을 한 번 더
-  return pairs;
+  let id = 0;
+  return pairs.map(p => [{ id: id++, ch: p.d.c, kind: "h" }, { id: id++, ch: p.d.c, kind: p.kind }]);
+}
+
+// ── 판 구조 ──
+function emptyStack() { return Array.from({ length: R + 2 }, () => Array.from({ length: C + 2 }, () => [])); }
+function height(r, c) { return stack[r] && stack[r][c] ? stack[r][c].length : 0; }
+function topOf(r, c) { const s = stack[r][c]; return s[s.length - 1]; }
+function allTiles() {
+  const out = [];
+  for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) for (const t of stack[r][c]) out.push(t);
+  return out;
+}
+function findTile(id) { return allTiles().find(t => t.id === id); }
+function isTop(t) { return topOf(t.r, t.c) === t; }
+// 쌓기 판: 위가 비어 있고 왼쪽이나 오른쪽이 트여 있어야 고를 수 있다.
+function isFree(t) {
+  if (!isTop(t)) return false;
+  if (layers === 1) return true;
+  return height(t.r, t.c - 1) <= t.L || height(t.r, t.c + 1) <= t.L;
+}
+function positionsFor() {
+  const out = [];
+  for (let k = 0; k < layers; k++)
+    for (let r = 1 + k; r <= R - k; r++)
+      for (let c = 1 + k; c <= C - k; c++) out.push({ L: k, r, c });
+  return out;
+}
+function pairUp(ts) {
+  const g = {};
+  for (const t of ts) (g[t.ch] ||= { h: [], p: [] })[t.kind === "h" ? "h" : "p"].push(t);
+  const out = [];
+  for (const k in g) g[k].h.forEach((h, i) => out.push([h, g[k].p[i]]));
+  return out;
+}
+function placeRandom(positions, pairs) {
+  const ts = shuffle(pairs.flat());
+  return positions.map((p, i) => [ts[i], p]);
+}
+// 끝까지 풀 수 있는 배치: 꽉 찬 판에서 "지금 고를 수 있는 자리 두 곳"을 골라 짝을 놓고 지워 나간다.
+// 이 순서를 그대로 따라 하면 판이 모두 비워지므로 언제나 풀린다.
+function placeSolvable(positions, pairs) {
+  const key = (r, c) => r * 100 + c;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const h = {};
+    for (const p of positions) h[key(p.r, p.c)] = (h[key(p.r, p.c)] || 0) + 1;
+    const H = (r, c) => h[key(r, c)] || 0;
+    let rest = positions.slice();
+    const plan = [];
+    let ok = true;
+    for (const pair of shuffle(pairs.slice())) {
+      const free = rest.filter(p => H(p.r, p.c) === p.L + 1 && (H(p.r, p.c - 1) <= p.L || H(p.r, p.c + 1) <= p.L));
+      if (free.length < 2) { ok = false; break; }
+      shuffle(free);
+      const [a, b] = free;
+      const [x, y] = Math.random() < 0.5 ? pair : [pair[1], pair[0]];
+      plan.push([x, a], [y, b]);
+      rest = rest.filter(p => p !== a && p !== b);
+      h[key(a.r, a.c)]--; h[key(b.r, b.c)]--;
+    }
+    if (ok) return plan;
+  }
+  return null;
+}
+function applyPlan(plan) {
+  stack = emptyStack();
+  plan.sort((x, y) => x[1].L - y[1].L);
+  for (const [t, p] of plan) { t.L = p.L; t.r = p.r; t.c = p.c; stack[p.r][p.c].push(t); }
+}
+function arrange(positions, pairs) {
+  if (layers === 1) applyPlan(placeRandom(positions, pairs));
+  else applyPlan(placeSolvable(positions, pairs) || placeRandom(positions, pairs));
 }
 
 function newGame() {
   const range = $("range").value, mode = $("mode").value, size = $("size").value;
-  const [lg, sm] = SIZES[size];
+  layers = +$("layers").value;
+  const [lg, sm] = (layers === 1 ? FLAT_SIZES : STACK_SIZES)[size];
   const portrait = $("boardWrap").clientWidth < 640;
   C = portrait ? sm : lg; R = portrait ? lg : sm;
-  const pairs = pickPairs(R * C / 2, range, mode);
-  const tiles = [];
-  let id = 0;
-  for (const p of pairs) {
-    tiles.push({ id: id++, c: p.d.c, kind: "h" });
-    tiles.push({ id: id++, c: p.d.c, kind: p.kind });
-  }
-  grid = Array.from({ length: R + 2 }, () => Array(C + 2).fill(null));
-  shuffle(tiles);
-  let k = 0;
-  for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) grid[r][c] = tiles[k++];
+  const positions = positionsFor();
+  arrange(positions, pickPairs(positions.length / 2, range, mode));
   ensureMovable();
   sel = null; score = 0; elapsed = 0; hints = 5; shuffles = 3; combo = 0; lastMatch = 0; learned = []; over = false; busy = false;
-  render(); renderLearned(); updateStats(); startTimer();
+  updateRule(); render(); renderLearned(); updateStats(); startTimer();
 }
 
 function startTimer() {
@@ -396,7 +473,7 @@ function startTimer() {
   timer = setInterval(() => { if (!over && !document.hidden) { elapsed++; updateStats(); } }, 1000);
 }
 
-// ── 경로 찾기: 빈 칸(바깥 테두리 포함)으로만, 꺾임 2번 이하 ──
+// ── 1층 판 경로 찾기: 빈 칸(바깥 테두리 포함)으로만, 꺾임 2번 이하 ──
 const DR = [-1, 0, 1, 0], DC = [0, 1, 0, -1];
 function findPath(a, b) {
   const H = R + 2, W = C + 2;
@@ -410,7 +487,7 @@ function findPath(a, b) {
     if (nr < 0 || nc < 0 || nr >= H || nc >= W) continue;
     const node = { r: nr, c: nc, p: s };
     if (nr === b[0] && nc === b[1]) return corners(node);
-    if (grid[nr][nc]) continue;
+    if (height(nr, nc)) continue;
     for (let nd = 0; nd < 4; nd++) {
       if (nd === (s.d + 2) % 4) continue;
       const nt = s.t + (nd !== s.d ? 1 : 0);
@@ -440,29 +517,24 @@ function corners(node) {
 }
 
 function isPair(t1, t2) {
-  return t1.c === t2.c && ((t1.kind === "h") !== (t2.kind === "h"));
+  return t1.ch === t2.ch && ((t1.kind === "h") !== (t2.kind === "h"));
 }
 function findMove() {
   const groups = {};
-  for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) {
-    const t = grid[r][c]; if (!t) continue;
-    (groups[t.c] ||= { h: [], p: [] })[t.kind === "h" ? "h" : "p"].push([r, c]);
+  for (const t of allTiles()) {
+    if (!isFree(t)) continue;
+    (groups[t.ch] ||= { h: [], p: [] })[t.kind === "h" ? "h" : "p"].push(t);
   }
   for (const k in groups) for (const a of groups[k].h) for (const b of groups[k].p) {
-    if (findPath(a, b)) return [a, b];
+    if (layers > 1 || findPath([a.r, a.c], [b.r, b.c])) return [a, b];
   }
   return null;
 }
-function remaining() {
-  let n = 0;
-  for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) if (grid[r][c]) n++;
-  return n;
-}
+function remaining() { return allTiles().length; }
 function reshuffle() {
-  const pos = [], tiles = [];
-  for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) if (grid[r][c]) { pos.push([r, c]); tiles.push(grid[r][c]); }
-  shuffle(tiles);
-  pos.forEach(([r, c], i) => grid[r][c] = tiles[i]);
+  const ts = allTiles();
+  const positions = ts.map(t => ({ L: t.L, r: t.r, c: t.c }));
+  arrange(positions, pairUp(ts));
 }
 function ensureMovable() {
   for (let i = 0; i < 200 && remaining() && !findMove(); i++) reshuffle();
@@ -472,44 +544,45 @@ function ensureMovable() {
 function layout() {
   const avail = $("boardWrap").clientWidth;
   const availH = Math.max(320, window.innerHeight - 200);
-  // 보드 폭 = C*w + 2m (m = 0.45w), 높이 = R*h + 2m, h = 1.3w
-  let w = Math.min(58, avail / (C + 0.9), availH / (R * 1.3 + 0.9));
+  const extra = (layers - 1) * 0.14;
+  // 보드 폭 = C*w + 2m (m = 0.45w) + 층 높이만큼의 여백, 높이도 같은 방식 (h = 1.3w)
+  let w = Math.min(58, avail / (C + 0.9 + extra), availH / (R * 1.3 + 0.9 + extra));
   w = Math.max(28, Math.floor(w));
-  cell = { w, h: Math.round(w * 1.3), m: Math.round(w * 0.45) };
-  boardEl.style.width = (C * cell.w + 2 * cell.m) + "px";
-  boardEl.style.height = (R * cell.h + 2 * cell.m) + "px";
+  const lift = layers > 1 ? Math.max(4, Math.round(w * 0.14)) : 0;
+  cell = { w, h: Math.round(w * 1.3), m: Math.round(w * 0.45), lift };
+  const off = (layers - 1) * lift;
+  boardEl.style.width = (C * cell.w + 2 * cell.m + off) + "px";
+  boardEl.style.height = (R * cell.h + 2 * cell.m + off) + "px";
 }
-function cx(c) { return c === 0 ? cell.m / 2 : c === C + 1 ? cell.m * 1.5 + C * cell.w : cell.m + (c - 1) * cell.w + cell.w / 2; }
-function cy(r) { return r === 0 ? cell.m / 2 : r === R + 1 ? cell.m * 1.5 + R * cell.h : cell.m + (r - 1) * cell.h + cell.h / 2; }
+function off() { return (layers - 1) * cell.lift; }
+function cx(c) { return off() + (c === 0 ? cell.m / 2 : c === C + 1 ? cell.m * 1.5 + C * cell.w : cell.m + (c - 1) * cell.w + cell.w / 2); }
+function cy(r) { return off() + (r === 0 ? cell.m / 2 : r === R + 1 ? cell.m * 1.5 + R * cell.h : cell.m + (r - 1) * cell.h + cell.h / 2); }
 
 function render() {
   layout();
   boardEl.querySelectorAll(".tile, #win").forEach(e => e.remove());
   pathEl.innerHTML = "";
-  for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) {
-    const t = grid[r][c]; if (!t) continue;
-    boardEl.appendChild(makeTile(t, r, c));
-  }
+  for (const t of allTiles()) boardEl.appendChild(makeTile(t));
+  updateLocks();
 }
-function makeTile(t, r, c) {
-  const d = BY[t.c];
+function makeTile(t) {
+  const d = BY[t.ch];
   const el = document.createElement("button");
   el.className = "tile " + t.kind;
   el.dataset.id = t.id;
-  const depth = 6; // 패 두께(그림자)만큼 비워 둔다
   Object.assign(el.style, {
-    left: (cell.m + (c - 1) * cell.w - depth / 2) + "px",
-    top: (cell.m + (r - 1) * cell.h - depth / 2) + "px",
-    width: (cell.w - depth) + "px",
-    height: (cell.h - depth) + "px",
-    zIndex: r * 50 + c,
+    left: (off() + cell.m + (t.c - 1) * cell.w - DEPTH / 2 - t.L * cell.lift) + "px",
+    top: (off() + cell.m + (t.r - 1) * cell.h - DEPTH / 2 - t.L * cell.lift) + "px",
+    width: (cell.w - DEPTH) + "px",
+    height: (cell.h - DEPTH) + "px",
+    zIndex: t.L * 1000 + t.r * 50 + t.c,
   });
   const face = document.createElement("span");
   face.className = "face";
   if (t.kind === "h") {
-    face.textContent = t.c;
+    face.textContent = t.ch;
     face.style.fontSize = Math.round(cell.w * 0.7) + "px";
-    el.setAttribute("aria-label", "한자 " + t.c);
+    el.setAttribute("aria-label", "한자 " + t.ch);
   } else {
     const txt = partnerText(d, t.kind);
     face.textContent = txt;
@@ -527,44 +600,64 @@ function makeTile(t, r, c) {
   return el;
 }
 function tileEl(id) { return boardEl.querySelector('.tile[data-id="' + id + '"]'); }
-function locate(id) {
-  for (let r = 1; r <= R; r++) for (let c = 1; c <= C; c++) if (grid[r][c] && grid[r][c].id === id) return [r, c];
-  return null;
+function updateLocks() {
+  for (const t of allTiles()) {
+    const el = tileEl(t.id); if (!el) continue;
+    const top = isTop(t);
+    el.classList.toggle("under", !top);
+    el.classList.toggle("locked", top && !isFree(t));
+    el.tabIndex = top ? 0 : -1;
+  }
+}
+function center(t) {
+  const el = tileEl(t.id);
+  return [el.offsetLeft + el.offsetWidth / 2, el.offsetTop + el.offsetHeight / 2];
 }
 
 // ── 조작 ──
+function shake(id) { const e = tileEl(id); e.classList.remove("bad"); void e.offsetWidth; e.classList.add("bad"); }
 function onTile(id) {
   if (busy || over) return;
-  const pos = locate(id); if (!pos) return;
-  const t = grid[pos[0]][pos[1]];
+  const t = findTile(id); if (!t) return;
   clearHints();
-  if (!sel) { select(id); return; }
+  if (!isFree(t)) {
+    shake(id);
+    toast("아직 막힌 패예요. 위에 패가 없고 왼쪽이나 오른쪽이 트인 밝은 패만 고를 수 있어요.");
+    return;
+  }
+  if (sel == null) { select(id); return; }
   if (sel === id) { deselect(); return; }
-  const p0 = locate(sel), t0 = grid[p0[0]][p0[1]];
+  const t0 = findTile(sel);
   if ((t0.kind === "h") === (t.kind === "h")) { deselect(); select(id); return; } // 같은 종류끼리는 선택만 옮김
   const hz = t0.kind === "h" ? t0 : t;
-  const d = BY[hz.c];
+  const d = BY[hz.ch];
   if (!isPair(t0, t)) {
     combo = 0;
-    [sel, id].forEach(x => { const e = tileEl(x); e.classList.remove("bad"); void e.offsetWidth; e.classList.add("bad"); });
+    shake(sel); shake(id);
     toast(`<span class="hz">${d.c}</span>은(는) <b>${d.hun} ${d.eum}</b> — 짝이 아니에요`);
     deselect();
     return;
   }
-  const path = findPath(p0, pos);
-  if (!path) {
-    toast("짝은 맞지만 길이 막혔어요. 꺾임 두 번 이하로 이어져야 해요.");
-    deselect(); select(id);
-    return;
+  let pts;
+  if (layers === 1) {
+    const path = findPath([t0.r, t0.c], [t.r, t.c]);
+    if (!path) {
+      toast("짝은 맞지만 길이 막혔어요. 꺾임 두 번 이하로 이어져야 해요.");
+      deselect(); select(id);
+      return;
+    }
+    pts = path.map(([r, c]) => [cx(c), cy(r)]);
+  } else {
+    pts = [center(t0), center(t)];
   }
   // 성공
-  drawPath(path);
+  drawPath(pts);
   const now = Date.now();
   combo = now - lastMatch < 4000 ? combo + 1 : 0;
   lastMatch = now;
   score += 100 + combo * 50;
   [sel, id].forEach(x => tileEl(x).classList.add("gone"));
-  grid[p0[0]][p0[1]] = null; grid[pos[0]][pos[1]] = null;
+  stack[t0.r][t0.c].pop(); stack[t.r][t.c].pop();
   sel = null;
   if (!learned.includes(d.c)) learned.push(d.c);
   renderLearned();
@@ -575,10 +668,11 @@ function onTile(id) {
     busy = false;
     pathEl.innerHTML = "";
     boardEl.querySelectorAll(".tile.gone").forEach(e => e.remove());
+    updateLocks();
     if (!remaining()) return win();
     if (!findMove()) {
       ensureMovable(); render();
-      toast("이어지는 짝이 없어서 남은 패를 섞었어요.");
+      toast("고를 수 있는 짝이 없어서 남은 패를 섞었어요.");
     }
   }, 380);
 }
@@ -587,10 +681,9 @@ function deselect() { if (sel != null) { const e = tileEl(sel); if (e) e.classLi
 function clearHints() { boardEl.querySelectorAll(".tile.hint").forEach(e => e.classList.remove("hint")); }
 
 function drawPath(pts) {
-  const s = pts.map(([r, c]) => cx(c) + "," + cy(r)).join(" ");
   pathEl.setAttribute("width", boardEl.style.width);
   pathEl.setAttribute("height", boardEl.style.height);
-  pathEl.innerHTML = `<polyline points="${s}"></polyline>`;
+  pathEl.innerHTML = `<polyline points="${pts.map(p => p.join(",")).join(" ")}"></polyline>`;
 }
 
 function useHint() {
@@ -598,7 +691,7 @@ function useHint() {
   const mv = findMove(); if (!mv) return;
   hints--; score = Math.max(0, score - 50);
   clearHints(); deselect();
-  mv.forEach(([r, c]) => tileEl(grid[r][c].id).classList.add("hint"));
+  mv.forEach(t => tileEl(t.id).classList.add("hint"));
   updateStats();
 }
 function useShuffle() {
@@ -617,6 +710,11 @@ function win() {
 }
 
 // ── 표시 ──
+function updateRule() {
+  $("rule").innerHTML = layers === 1
+    ? "한자 패와 그 한자의 <b>음</b> 패 또는 <b>뜻</b> 패를 차례로 누르세요. 두 패를 잇는 선이 두 번 이하로 꺾이면 짝이 사라집니다."
+    : `패가 <b>${layers}층</b>으로 쌓여 있어요. 한자 패와 그 한자의 <b>음</b>·<b>뜻</b> 패를 차례로 누르세요. 위에 패가 없고 왼쪽이나 오른쪽이 트인 <b>밝은 패</b>만 고를 수 있어요.`;
+}
 function fmt(s) { return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
 function updateStats() {
   $("left").textContent = remaining() / 2;
@@ -647,18 +745,19 @@ function toast(html) {
 $("newBtn").addEventListener("click", newGame);
 $("hintBtn").addEventListener("click", useHint);
 $("shufBtn").addEventListener("click", useShuffle);
-["range", "mode", "size"].forEach(id => $(id).addEventListener("change", newGame));
+["range", "mode", "size", "layers"].forEach(id => $(id).addEventListener("change", newGame));
 let rz = null;
 window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { const s = sel; render(); if (s != null && tileEl(s)) select(s); if (over) win(); }, 150); });
 
 // 뷰어 업데이트 때 진행 중인 판을 유지
-function snapshot() { return { R, C, grid, score, elapsed, hints, shuffles, learned, over }; }
+function snapshot() { return { v: 3, layers, R, C, stack, score, elapsed, hints, shuffles, learned, over }; }
 function start(data) {
   renderDict();
-  if (data && data.grid && data.R) {
-    ({ R, C, grid, score, elapsed, hints, shuffles, learned } = data);
+  if (data && data.v === 3 && data.stack) {
+    ({ layers, R, C, stack, score, elapsed, hints, shuffles, learned } = data);
+    $("layers").value = String(layers);
     over = false; sel = null;
-    render(); renderLearned(); updateStats(); startTimer();
+    updateRule(); render(); renderLearned(); updateStats(); startTimer();
     if (data.over) win();
   } else newGame();
 }
